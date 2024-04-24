@@ -1,0 +1,428 @@
+import os
+import warnings
+import logging
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import seaborn as sns
+import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
+import plotly.graph_objs as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+from IPython.display import display, HTML
+
+
+warnings.simplefilter(action="ignore")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def setup_paths(date_str, specific_dates):
+    data_folder = "Visualization/Data/Orders/"
+    output_folder_base = "Visualization/Graphs/Orders/"
+    
+    input_file_name = f"Order_Monitoring_{date_str}.csv"
+    output_folder = os.path.join(output_folder_base, date_str)
+    input_file_path = os.path.join(data_folder, input_file_name)
+    output_path = os.path.join(output_folder)
+    
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+
+    current_df = None
+    try:
+        current_df = pd.read_csv(input_file_path, sep=";")
+        logging.info(f"Input file path for current visualization: {input_file_path}")
+        logging.info(f"Output path for current visualization: {output_path}")
+        logging.info(f"Current DataFrame shape before duplicates preprocessing: {current_df.shape}")
+        
+        # Preprocessing on current_df
+        current_df['UPDATE DATE'] = pd.to_datetime(current_df['UPDATE DATE'].str.split().str[0], format='%d/%m/%Y', errors='coerce')
+        current_df.dropna(subset=['UPDATE DATE'], inplace=True)
+        current_df.sort_values('UPDATE DATE', inplace=True)
+        current_df.drop_duplicates(subset='ORDER CODE', keep='last', inplace=True)
+        logging.info(f"Current DataFrame shape after duplicates preprocessing: {current_df.shape}")
+    except Exception as e:
+        logging.error(f"Error processing current data: {e}")
+        return None, None, None
+
+    total_rows_before = 0
+    combined_df = pd.DataFrame()
+    specific_dates_dt = pd.to_datetime(specific_dates, format="%d-%m-%Y")
+
+    for file in os.listdir(data_folder):
+        if file.endswith(".csv") and pd.to_datetime(file.split("_")[-1].split('.')[0], format="%d-%m-%Y") in specific_dates_dt:
+            try:
+                df = pd.read_csv(os.path.join(data_folder, file), sep=";")
+                total_rows_before += df.shape[0]
+                df['UPDATE DATE'] = pd.to_datetime(df['UPDATE DATE'].str.split().str[0], format='%d/%m/%Y', errors='coerce')
+                df.dropna(subset=['UPDATE DATE'], inplace=True)
+                df.sort_values('UPDATE DATE', inplace=True)
+                df.drop_duplicates(subset='ORDER CODE', keep='last', inplace=True)
+                combined_df = pd.concat([combined_df, df], ignore_index=True)
+            except Exception as e:
+                logging.error(f"Error processing file {file}: {e}")
+
+    logging.info(f"Combined DataFrame shape before duplicates preprocessing: ({total_rows_before}, {combined_df.shape[1]})")
+    logging.info(f"Combined DataFrame shape after duplicates preprocessing: {combined_df.shape}")
+
+    return current_df, combined_df, output_path
+
+def remove_stores(current_df, combined_df):
+    """
+    Preprocess the data for graph generation by converting specified columns to datetime and logging DataFrame shapes.
+    
+    :param current_df: DataFrame for current visualization.
+    :param combined_df: DataFrame for trend analysis.
+    :param date_columns: List of column names to convert to datetime.
+    """
+    # Date columns
+    
+    date_columns = ['RUN TIME', 'DATE', 'MODIFIED TIME', 'UPDATE DATE']
+    for col in date_columns:
+        current_df[col] = pd.to_datetime(current_df[col], dayfirst=True)
+        combined_df[col] = pd.to_datetime(combined_df[col], dayfirst=True, errors='ignore')  # 'errors=ignore' for columns not in combined_df
+
+    # Drop rows based on ORDER TYPE CODE
+    order_type_to_drop = ["ZL2", "ZL3", "ZDE", "ZBC"]
+    current_df = current_df[~current_df['ORDER TYPE CODE'].isin(order_type_to_drop)]
+    combined_df = combined_df[~combined_df['ORDER TYPE CODE'].isin(order_type_to_drop)]
+    logging.info(f"DataFrame shape after removing ZBC, ZDE, ZL2, ZL3: current_df: {current_df.shape}, combined_df: {combined_df.shape}")
+
+    # Drop rows based on BASE STORE containing specific substrings
+    substrings_to_drop = ['retailpos', 'indirectretailer', 'fieldCoach']
+    current_df = current_df[~current_df['BASE STORE'].str.contains('|'.join(substrings_to_drop), case=False, na=False)]
+    combined_df = combined_df[~combined_df['BASE STORE'].str.contains('|'.join(substrings_to_drop), case=False, na=False)]
+    logging.info(f"DataFrame shape after removing FieldCoach, indirectretailer, retailpos: current_df: {current_df.shape}, combined_df: {combined_df.shape}")
+    
+    # Create 'DAYS SINCE RUN TIME' column (for LSP Conditions)
+    current_df['DAYS SINCE RUN TIME'] = (current_df['RUN TIME'] - current_df['DATE']).dt.days
+    combined_df['DAYS SINCE RUN TIME'] = (combined_df['RUN TIME'] - combined_df['DATE']).dt.days
+    
+    return current_df, combined_df
+
+def apply_LSP_conditions(current_df, combined_df, conditions_config):
+    # Initial dataframes shapes for both current and combined
+    initial_shape_current = current_df.shape
+    initial_shape_combined = combined_df.shape
+
+    for country, config in conditions_config.items():
+        status = config['status']
+        days = config['days_since_run_time']
+
+        # Conditions to keep the orders
+        condition_to_keep_current = ~((current_df['COUNTRY'] == country) &
+                                      (current_df['PMI ORDER STATUS'] == status) &
+                                      ((current_df['RUN TIME'] - current_df['DATE']).dt.days <= days))
+        current_df = current_df[condition_to_keep_current]
+
+        condition_to_keep_combined = ~((combined_df['COUNTRY'] == country) &
+                                       (combined_df['PMI ORDER STATUS'] == status) &
+                                       ((combined_df['RUN TIME'] - combined_df['DATE']).dt.days <= days))
+        combined_df = combined_df[condition_to_keep_combined]
+
+        # Log the shape after conditions applied
+        logging.info(f"After applying conditions: current_df shape {current_df.shape}, combined_df shape {combined_df.shape}")
+
+    # Final logging after processing
+    logging.info(f"Final DataFrame shape for current_df: {current_df.shape}, initially was: {initial_shape_current}")
+    logging.info(f"Final DataFrame shape for combined_df: {combined_df.shape}, initially was: {initial_shape_combined}")
+
+    return current_df, combined_df
+
+def visualize_graph_1_current(current_df, output_path, include_countries=None, exclude_countries=[]):
+    try:
+        # Filter based on included and excluded countries
+        if include_countries is not None:
+            current_df = current_df[current_df['COUNTRY'].isin(include_countries)]
+        if exclude_countries:
+            current_df = current_df[~current_df['COUNTRY'].isin(exclude_countries)]
+
+        # Data preparation
+        relevant_statuses = ['CREATED', 'PROCESSED', 'RECEIVED', 'SHIPPED']
+        grouped_data = current_df.groupby(['COUNTRY', 'PMI ORDER STATUS'])['ORDER CODE'].nunique().reset_index()
+        filtered_data_g2 = grouped_data[grouped_data['PMI ORDER STATUS'].isin(relevant_statuses)]
+        total_orders_g2 = filtered_data_g2['ORDER CODE'].sum()
+
+        if filtered_data_g2.empty or total_orders_g2 == 0:
+            logging.info("No data available for selected statuses or countries, or no orders to count.")
+            return
+
+        logging.info(f"DataFrame shape for Graph 2: {filtered_data_g2.shape}")
+
+        fig, axes = plt.subplots(2, 2, figsize=(14, 8.5), constrained_layout=True)
+        fig.suptitle('Count of Order Per Country Per Status')
+
+        for i, status in enumerate(relevant_statuses):
+            filtered_status_data = filtered_data_g2[filtered_data_g2['PMI ORDER STATUS'] == status].copy()
+            
+            if filtered_status_data.empty:
+                logging.info(f"No data available to plot for status '{status}' in the provided country list.")
+                continue  # Skip this status if there is no data
+
+            filtered_status_data.sort_values(by='ORDER CODE', ascending=False, inplace=True)
+            total_orders_current_status = filtered_status_data['ORDER CODE'].sum()
+            percentage_of_total = (total_orders_current_status / total_orders_g2) * 100 if total_orders_g2 > 0 else 0
+
+            row, col = divmod(i, 2)
+            ax = sns.barplot(x='COUNTRY', y='ORDER CODE', data=filtered_status_data, ax=axes[row, col], palette='viridis')
+            ax.set_title(f'Orders in {status} Status ({percentage_of_total:.1f}% of all orders)')
+            ax.set_xlabel('Country')
+            ax.set_ylabel('Unique Order Count')
+            ax.tick_params(axis='x', rotation=45)
+            ax.grid(axis='y', linestyle='--', alpha=0.7)
+
+            # Annotate bars with count
+            for p in ax.patches:
+                ax.annotate(f'{int(p.get_height())}', (p.get_x() + p.get_width() / 2., p.get_height()), ha='center', va='bottom')
+
+            # Add total count label inside the plot area
+            ax.text(0.95, 0.95, f'Total: {total_orders_current_status:,}', transform=ax.transAxes, 
+                    horizontalalignment='right', verticalalignment='top', fontsize=10, color='black', weight='bold')
+
+        plt.savefig(os.path.join(output_path, 'Order_Status_Count.png'))
+        plt.show()
+
+    except Exception as e:
+        logging.error(f"An error occurred during visualization: {e}")
+
+def visualize_graph_2_over_under(current_df, output_path, include_countries=None, exclude_countries=[]):
+    try:
+        # Filter based on included and excluded countries
+        if include_countries is not None:
+            current_df = current_df[current_df['COUNTRY'].isin(include_countries)]
+        if exclude_countries:
+            current_df = current_df[~current_df['COUNTRY'].isin(exclude_countries)]
+
+        # Ensure 'RUN TIME' and 'UPDATE DATE' are datetime
+        current_df['RUN TIME'] = pd.to_datetime(current_df['RUN TIME'])
+        current_df['UPDATE DATE'] = pd.to_datetime(current_df['UPDATE DATE'])
+
+        # Calculate 'ORDER AGE' and 'AGE CATEGORY'
+        current_date = datetime.now()
+        current_df['ORDER AGE'] = (current_date.date() - current_df['UPDATE DATE'].dt.date).apply(lambda x: x.days)
+        current_df['AGE CATEGORY'] = current_df['ORDER AGE'].apply(lambda x: 'Under 30 days' if x < 30 else 'Over 30 days')
+
+        # Prepare Data for Graph 3
+        relevant_statuses = ['CREATED', 'PROCESSED', 'RECEIVED', 'SHIPPED']
+        grouped_data = current_df.groupby(['COUNTRY', 'PMI ORDER STATUS', 'AGE CATEGORY'])['ORDER CODE'].nunique().reset_index()
+        filtered_data = grouped_data[grouped_data['PMI ORDER STATUS'].isin(relevant_statuses)]
+        
+        # Ensure sorting of bars within each subplot from largest to smallest
+        filtered_data.sort_values(by=['PMI ORDER STATUS', 'ORDER CODE'], ascending=[True, False], inplace=True)
+
+        total_orders = filtered_data['ORDER CODE'].sum()
+
+        if filtered_data.empty or total_orders == 0:
+            logging.info("No data available for selected statuses or countries, or no orders to count.")
+            return
+
+        logging.info(f"DataFrame shape for Graph 3: {filtered_data.shape}")
+
+        # Plotting
+        fig, axes = plt.subplots(2, 2, figsize=(14, 8.5))
+        fig.suptitle('Over vs Under 30 days Per Country Per Status')
+        
+        for i, status in enumerate(relevant_statuses):
+            ax = axes[i//2, i%2]
+            filtered_status_data = filtered_data[filtered_data['PMI ORDER STATUS'] == status].copy()
+            
+            if filtered_status_data.empty:
+                logging.info(f"No data available to plot for status '{status}'.")
+                continue
+
+            sns.barplot(x='COUNTRY', y='ORDER CODE', hue='AGE CATEGORY', data=filtered_status_data,
+                        ax=ax, palette='coolwarm')
+            ax.set_title(f'Orders in {status} Status')
+            ax.set_xlabel('Country')
+            ax.set_ylabel('Unique Order Count')
+            ax.tick_params(axis='x', rotation=45)
+            ax.grid(axis='y', linestyle='--', alpha=0.7)
+
+            # Only have whole numbers on the y-axis
+            ax.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+
+            # Annotate bars with count
+            for p in ax.patches:
+                height = p.get_height()
+                if pd.notnull(height):  # Check if height is not NaN
+                    ax.annotate(f'{int(height)}', (p.get_x() + p.get_width() / 2., height), 
+                                ha='center', va='bottom')
+
+            # Adjust legend position to be in the upper right corner of the subplot
+            ax.legend(loc='upper right')
+
+        plt.tight_layout(rect=[0, 0, 1, 0.95])  # Adjust the rect parameter to prevent suptitle overlap
+        plt.savefig(os.path.join(output_path, 'Over_Under_30_days.png'))
+        plt.show()
+
+    
+    except Exception as e:
+        logging.error(f"An error occurred during visualization: {e}")
+
+def visualize_graph_3_trend(combined_df, output_path, specific_dates, include_countries=None, exclude_countries=[]):    
+    try:
+        # Filter based on included and excluded countries
+        if include_countries:
+            combined_df = combined_df[combined_df['COUNTRY'].isin(include_countries)]
+        if exclude_countries:
+            combined_df = combined_df[~combined_df['COUNTRY'].isin(exclude_countries)]
+        
+        if combined_df.empty:
+            logging.info("No data available after applying country filters.")
+            return
+        
+        # Ensure 'RUN TIME' is in datetime format for grouping
+        combined_df['RUN TIME'] = pd.to_datetime(combined_df['RUN TIME'])
+        
+        # Check for any NaT or invalid dates
+        if combined_df['RUN TIME'].isnull().any():
+            logging.error("Invalid or NaT dates found in 'RUN TIME' column.")
+            return
+
+        # Convert to just date format for consistency
+        combined_df['RUN TIME'] = combined_df['RUN TIME'].dt.date
+
+        logging.info(f"DataFrame shape after filtering: {combined_df.shape}")
+        filtered_data_g3 = combined_df.groupby(["COUNTRY", "PMI ORDER STATUS", "RUN TIME"])["ORDER CODE"].count().reset_index()
+
+        if filtered_data_g3.empty:
+            logging.info("No data available for plotting after grouping.")
+            return
+        
+        logging.info(f"DataFrame shape for Graph 4: {filtered_data_g3.shape}")
+
+        # Ensure Matplotlib recognizes the specific_dates as dates for plotting
+        specific_dates = pd.to_datetime(specific_dates, format='%d-%m-%Y').date
+
+        # Plotting
+        fig, axes = plt.subplots(2, 2, figsize=(14, 8.5))
+        plt.subplots_adjust(right=0.85)  # Adjust the right space to accommodate the legend
+        fig.suptitle('Order Trend by Status')
+
+        order_statuses = ["CREATED", "RECEIVED", "PROCESSED", "SHIPPED"]
+        for i, status in enumerate(order_statuses):
+            ax = axes[i//2, i%2]
+            status_data = filtered_data_g3[filtered_data_g3["PMI ORDER STATUS"] == status]
+            agg_data = status_data.groupby(['COUNTRY', 'RUN TIME'])['ORDER CODE'].sum().reset_index()
+
+            # Convert 'RUN TIME' to ordinal for even spacing on x-axis
+            agg_data['RUN TIME ORDINAL'] = agg_data['RUN TIME'].apply(lambda date: date.toordinal())
+
+            for country in agg_data["COUNTRY"].unique():
+                country_data = agg_data[agg_data["COUNTRY"] == country]
+                ax.plot(country_data["RUN TIME ORDINAL"], country_data["ORDER CODE"], marker="o", label=country)
+
+            # Set y-axis to start from 0 and to be proportional
+            ax.set_ylim(bottom=0)
+            
+            # Set x-ticks to be evenly spaced
+            ax.xaxis.set_major_locator(ticker.MaxNLocator(nbins='auto', integer=True))
+            # Convert ordinals back to readable dates for the x-tick labels
+            ax.xaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: datetime.fromordinal(int(x)).strftime('%Y-%m-%d')))
+
+            ax.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+            ax.set_title(f'Orders in {status} Status')
+            ax.set_xlabel('Date')
+            ax.set_ylabel('Order Count')
+            ax.tick_params(axis='x', rotation=45)
+            ax.legend(title="Country", loc='upper left', bbox_to_anchor=(1,1))
+            ax.grid(axis='y', linestyle='--', alpha=0.7)
+
+        plt.tight_layout(rect=[0, 0, 1, 0.9])  # Adjust the rect parameter to prevent suptitle overlap
+        plt.savefig(os.path.join(output_path, 'Order Trend Analysis.png'))
+        plt.show()
+        logging.info(f"File saved successfully at: {output_path}")
+
+    except Exception as e:
+        logging.error(f"An error occurred during visualization: {e}")
+
+def visualize_graph_4_specific(current_df_no_lsp, output_path, country):
+    try:
+        # Filter for 'SHIPPED' orders
+        shipped_orders_df = current_df_no_lsp[current_df_no_lsp['PMI ORDER STATUS'] == 'SHIPPED']
+
+        # Calculate 'ORDER AGE' and create 'AGE CATEGORY'
+        current_date = datetime.now()
+        shipped_orders_df['ORDER AGE'] = (current_date.date() - shipped_orders_df['UPDATE DATE'].dt.date).apply(lambda x: x.days)
+        shipped_orders_df['AGE CATEGORY'] = pd.cut(shipped_orders_df['ORDER AGE'], 
+                                                   bins=[-np.inf, 7, 15, 30, np.inf], 
+                                                   labels=['Up to 7D', '7-15D', '15-30D Claim', 'Over 30D'])
+        
+        # Group data by 'COUNTRY' and 'AGE CATEGORY'
+        filtered_data_g4 = shipped_orders_df.groupby(['COUNTRY', 'AGE CATEGORY'])['ORDER CODE'].nunique().reset_index()
+        logging.info(f"DataFrame shape for Graph 4: {filtered_data_g4.shape}")
+
+        # Filter data for the specified country
+        country_data = filtered_data_g4[filtered_data_g4['COUNTRY'] == country]
+
+        # Create the bar plot
+        plt.figure(figsize=(10, 6))
+        ax = sns.barplot(x='AGE CATEGORY', y='ORDER CODE', data=country_data, palette='coolwarm')
+        plt.title(f'Order Age Distribution in {country}')
+        plt.xlabel('Age Category')
+        plt.ylabel('Unique Order Count')
+        plt.xticks(rotation=45)
+        plt.grid(axis='y', linestyle='--', alpha=0.7)
+
+        # Add labels on top of the bars
+        for p in ax.patches:
+            ax.annotate(f"{int(p.get_height())}", (p.get_x() + p.get_width() / 2., p.get_height()), ha='center', va='bottom')
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_path, f'{country}_Age_Distribution.png'))
+        plt.show()
+
+    except Exception as e:
+        logging.error(f"An error occurred during visualization: {e}")
+
+
+
+# Setup paths and load data
+date_str = "23-04-2024"
+specific_dates = ["08-03-2024", "15-03-2024", "22-03-2024", "29-03-2024", "02-04-2024", "04-04-2024",
+                  "09-04-2024", "11-04-2024", "16-04-2024",  "18-04-2024", "23-04-2024"]
+
+conditions_config = {
+    "CZ": {
+        "status": "SHIPPED",
+        "days_since_run_time": 15
+    }
+}
+
+current_df, combined_df, output_path = setup_paths(date_str, specific_dates)
+current_df, combined_df = remove_stores(current_df, combined_df)
+current_df_no_lsp = current_df.copy()
+combined_df_no_lsp = combined_df.copy()
+current_df, combined_df = apply_LSP_conditions(current_df, combined_df, conditions_config)
+
+
+#visualize_graph_1_current(current_df, output_path)
+#visualize_graph_1_current(current_df, output_path, exclude_countries=['CZ', 'FR', 'DE'])
+#visualize_graph_1_current(current_df, output_path, include_countries=['CZ', 'FR', 'DE'])
+
+#visualize_graph_2_over_under(current_df, output_path)
+#visualize_graph_2_over_under(current_df, output_path, exclude_countries=['CZ', 'FR', 'DE'])
+#visualize_graph_2_over_under(current_df, output_path, include_countries=['CZ', 'FR', 'DE'])
+
+#visualize_graph_3_trend(combined_df, output_path, specific_dates)
+#visualize_graph_3_trend(combined_df, output_path, specific_dates, include_countries=['CZ'])
+#visualize_graph_3_trend(combined_df, output_path, specific_dates, include_countries=['CZ'])
+
+visualize_graph_3_trend(combined_df, output_path, specific_dates, include_countries=['CZ'])
+visualize_graph_3_trend(combined_df_no_lsp, output_path, specific_dates, include_countries=['CZ'])
+
+#visualize_graph_4_specific(current_df_no_lsp, output_path, country='CZ')
+#visualize_graph_4_specific(current_df, output_path, country='CZ')
+#visualize_graph_4_specific(current_df_no_lsp, output_path, country='DE')
+
+
+
+
+
+
+
+
+
+
+
+
